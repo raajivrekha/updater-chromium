@@ -14,8 +14,13 @@ This script is designed to be a "set-and-forget" tool that keeps your Chromium b
 
 ## # Installation & Usage
 
-### 1. Initial Setup
+### Yee-Haw (Quick)
+```bash 
+curl -s https://raw.githubusercontent.com/raajivrekha/updater-chromium/main/updater-chromium | bash
+```
+
+### Lil' Slower (Regular)
 Run the script from your downloads or scripts folder. It will handle the pivot to your system path and schedule the daily task automatically.
 ```bash
 chmod +x updater-chromium
-./updater-chromium
+./updater-chromium```
