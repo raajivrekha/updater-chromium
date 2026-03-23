@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+
+# ==============================================================================
+# @program:      updater-chromium
+# @description:  Hardened Chromium Lifecycle Manager for macOS.
+# @version:      2.1.0
+# @stamp:        20260323-191500
+# @commit:       0x8F2C_GOLDEN_MASTER
+# ==============================================================================
+
+set -uo pipefail
+umask 0022
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GLOBALS & TELEMETRY
+# ──────────────────────────────────────────────────────────────────────────────
+VERSION="2.1.0"
+STAMP="20260323-191500"
+CORRELATION_ID="CHROM-GM-$(date +%s)"
+SCRIPT_NAME="updater-chromium"
+INSTALL_PATH="/usr/local/bin/$SCRIPT_NAME"
+TARGET_APP="/Applications/Chromium.app"
+BINARY_EXEC="$TARGET_APP/Contents/MacOS/Chromium"
+CACHE_BASE="/Users/Shared/ChromiumCache"
+LOG_FILE="$HOME/Library/Logs/$SCRIPT_NAME.log"
+PLIST_PATH="$HOME/Library/LaunchAgents/com.user.$SCRIPT_NAME.plist"
+SERVICE_LABEL="com.user.$SCRIPT_NAME"
+
+BASE_URL="https://download-chromium.appspot.com"
+USER_AGENT="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# Tracking variables for final summary
+JOB_STATUS="INITIALIZING"
+UPDATE_DEPLOYED="NO"
+IDENTIFIED_REV="UNKNOWN"
+
+log_event() {
+    local level="$1"; shift
+    local ts=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+    local msg="[$ts] [$STAMP] [$CORRELATION_ID] [$level] $* (PID=$$ PPID=$PPID)"
+    printf "%s\n" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+    [[ -t 1 ]] && printf "%s\n" "$msg"
+}
+
+phase_divider() {
+    log_event "i" "################################################################################"
+    log_event "i" "PHASE: $*"
+    log_event "i" "################################################################################"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RUNTIME IDENTITY HEADER
+# ──────────────────────────────────────────────────────────────────────────────
+print_identity() {
+    local arch=$(uname -m)
+    local path_curr=$(pwd)
+    phase_divider "IDENTITY & CONTEXT"
+    log_event "F" "Program:     $SCRIPT_NAME v$VERSION"
+    log_event "F" "Source:      $0"
+    log_event "F" "Arch:        $arch"
+    log_event "F" "User/UID:    $(whoami) ($(id -u))"
+    log_event "F" "Timestamp:   $(date)"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PRE-FLIGHT SYSTEM VALIDATION
+# ──────────────────────────────────────────────────────────────────────────────
+preflight_check() {
+    phase_divider "PRE-FLIGHT VALIDATION"
+    local required_tools=("sudo" "curl" "unzip" "plutil" "defaults" "launchctl" "stat")
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            log_event "X" "CRITICAL: Tool '$tool' is missing. Aborting."
+            JOB_STATUS="FAILED_PREFLIGHT"
+            exit 1
+        fi
+    done
+    log_event "F" "All required system binaries verified."
+}
+
+enforce_infrastructure() {
+    phase_divider "INFRASTRUCTURE & PIVOT"
+    local current_script
+    current_script=$(perl -e 'use Cwd "abs_path"; print abs_path($ARGV[0])' -- "$0")
+
+    if [[ "$current_script" != "$INSTALL_PATH" ]]; then
+        log_event "A" "FORCED PIVOT: Mirroring system binary to $INSTALL_PATH"
+        sudo mkdir -p "$(dirname "$INSTALL_PATH")"
+        sudo cp -f "$current_script" "$INSTALL_PATH"
+        sudo chown "$(whoami)" "$INSTALL_PATH"
+        sudo chmod 755 "$INSTALL_PATH"
+        sudo xattr -d com.apple.quarantine "$INSTALL_PATH" 2>/dev/null || true
+        log_event "A" "Handoff to $INSTALL_PATH. Terminating PID $$"
+        exec "$INSTALL_PATH" "$@"
+    fi
+
+    log_event "i" "Verifying system binary permissions..."
+    [[ "$(stat -f "%OLp" "$INSTALL_PATH")" != "755" ]] && chmod 755 "$INSTALL_PATH"
+    log_event "F" "Permissions Verified: 755"
+
+    log_event "A" "Generating/Linting LaunchAgent..."
+    cat <<EOF > "$PLIST_PATH"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$SERVICE_LABEL</string>
+    <key>ProgramArguments</key><array><string>$INSTALL_PATH</string></array>
+    <key>StartCalendarInterval</key><dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>$LOG_FILE</string>
+    <key>StandardErrorPath</key><string>$LOG_FILE</string>
+</dict>
+</plist>
+EOF
+    chmod 644 "$PLIST_PATH"
+    plutil -lint "$PLIST_PATH" >/dev/null 2>&1 || { log_event "X" "XML corruption detected."; exit 1; }
+
+    log_event "A" "Syncing GUI Domain Registry..."
+    local domain="gui/$(id -u)"
+    launchctl bootout "$domain" "$PLIST_PATH" 2>/dev/null || true
+    launchctl bootstrap "$domain" "$PLIST_PATH" 2>/dev/null || true
+
+    log_event "i" "Verifying Service Residency..."
+    if launchctl print "$domain/$SERVICE_LABEL" >/dev/null 2>&1; then
+        log_event "F" "Validation Success: Service active in GUI domain."
+    else
+        log_event "!" "Validation Warning: Service not detected in print list."
+    fi
+}
+
+fetch_and_deploy() {
+    phase_divider "ENVIRONMENT & MANIFEST"
+    local arch=$(uname -m)
+    local platform_slug=$([[ "$arch" == "arm64" ]] && echo "Mac_Arm" || echo "Mac")
+    local dl_url="$BASE_URL/dl/$platform_slug"
+
+    log_event "i" "Header Pre-flight (ETag comparison)..."
+    local remote_etag=$(curl -sIL -A "$USER_AGENT" "$dl_url" | grep -i "etag:" | awk '{print $2}' | tr -d '\r\n"' || echo "UNKNOWN")
+    IDENTIFIED_REV="$remote_etag"
+    log_event "F" "Remote ETag: $remote_etag"
+
+    if [[ "$remote_etag" != "UNKNOWN" && -d "$TARGET_APP" ]]; then
+        local local_etag=$(defaults read "$TARGET_APP/Contents/Info.plist" ChromiumETag 2>/dev/null || echo "0")
+        if [[ "$local_etag" == "$remote_etag" ]]; then
+            log_event "!" "System Idempotent. Skipping acquisition."
+            JOB_STATUS="SUCCESS (IDEMPOTENT)"
+            return 0
+        fi
+    fi
+
+    phase_divider "ACQUISITION & DEPLOYMENT"
+    mkdir -p "$CACHE_BASE"
+    local tmp_zip="$CACHE_BASE/chrome-mac-latest.zip"
+    log_event "A" "Downloading archive..."
+    curl -L -A "$USER_AGENT" -o "$tmp_zip" "$dl_url" || { log_event "X" "Download failed."; return 1; }
+
+    local tmp_ext=$(mktemp -d)
+    unzip -q "$tmp_zip" -d "$tmp_ext"
+    local app_source=$(find "$tmp_ext" -name "Chromium.app" -type d -maxdepth 3 | head -n 1)
+
+    [[ -z "$app_source" ]] && { log_event "X" "Transformation Error."; return 1; }
+
+    [[ "$remote_etag" != "UNKNOWN" ]] && defaults write "$app_source/Contents/Info.plist" ChromiumETag -string "$remote_etag"
+
+    pkill -x "Chromium" 2>/dev/null || true
+    sudo rm -rf "$TARGET_APP"
+    sudo mv "$app_source" "$TARGET_APP"
+    sudo xattr -cr "$TARGET_APP"
+
+    phase_divider "POST-DEPLOYMENT VALIDATION"
+    if "$BINARY_EXEC" --version --headless >/dev/null 2>&1; then
+        log_event "F" "Acceptance Gate Passed."
+        rm -rf "$HOME/Library/Caches/Chromium" "$HOME/Library/Caches/org.chromium.Chromium" 2>/dev/null || true
+        UPDATE_DEPLOYED="YES"
+        JOB_STATUS="SUCCESS (UPDATED)"
+    else
+        log_event "X" "Acceptance Gate FAILED."
+        JOB_STATUS="FAILED_VALIDATION"
+        return 1
+    fi
+    rm -rf "$tmp_ext"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FINAL SUMMARY & EXIT
+# ──────────────────────────────────────────────────────────────────────────────
+print_summary() {
+    phase_divider "JOB SUMMARY"
+    log_event "F" "Final Status:     $JOB_STATUS"
+    log_event "F" "Update Deployed:  $UPDATE_DEPLOYED"
+    log_event "F" "Active Revision:  $IDENTIFIED_REV"
+    log_event "F" "Automation:       ENABLED (10:00 AM Daily)"
+    log_event "i" "################################################################################"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# START
+# ──────────────────────────────────────────────────────────────────────────────
+mkdir -p "$(dirname "$LOG_FILE")"
+print_identity
+preflight_check
+enforce_infrastructure
+fetch_and_deploy
+print_summary
