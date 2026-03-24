@@ -23,4 +23,5 @@ curl -s https://raw.githubusercontent.com/raajivrekha/updater-chromium/main/upda
 Run the script from your downloads or scripts folder. It will handle the pivot to your system path and schedule the daily task automatically.
 ```bash
 chmod +x updater-chromium
-./updater-chromium```
+./updater-chromium
+```
